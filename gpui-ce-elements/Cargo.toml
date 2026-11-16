@@ -1,0 +1,47 @@
+# gpui_ce_elements 0.3.0 from crates.io, patched for Hydra (see
+# ../gpui-ce/HYDRA-PATCHES.md). The example and test targets and the
+# dev-dependencies are removed.
+
+[package]
+edition = "2024"
+name = "gpui_ce_elements"
+version = "0.3.0"
+build = false
+publish = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A community fork of Zed's GPU-accelerated UI framework"
+readme = false
+license = "Apache-2.0"
+
+[lib]
+name = "gpui_ce_elements"
+path = "src/lib.rs"
+
+[dependencies.derive_setters]
+version = "0.1.9"
+
+[dependencies.gpui]
+version = "0.3.0"
+default-features = false
+package = "gpui-ce"
+
+[dependencies.palette]
+version = "0.7.6"
+features = ["serializing"]
+
+[dependencies.smallvec]
+version = "1.6"
+features = [
+    "union",
+    "const_new",
+]
+
+[dependencies.unicode-segmentation]
+version = "1.10"
+
+[dependencies.web-time]
+version = "1.1.0"

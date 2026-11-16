@@ -1,0 +1,169 @@
+Hydra patches for gpui_ce_wgpu 0.3.0 (crates.io), for the Linux build.
+Applied on 2026-11-15 to the vendored copy in vendor/gpui-ce-wgpu (then
+under rewrite/; the registry crate copied byte for byte, then from the
+repository root:
+
+    git apply --recount --directory=vendor/gpui-ce-wgpu vendor/gpui-ce-wgpu.hydra.patch
+
+`--recount`: the hunk headers' line counts were written by hand; run from
+the crate's own folder, git apply skips every path without a word). Kept as
+the record of the change; vendor/gpui-ce/HYDRA-PATCHES.md ("gpui_ce_wgpu
+0.3.0") lists it and the later edits. ../gpui-ce/src/window.rs's
+`with_element_mask_group` and `with_element_transform_group` now fall back
+only on macOS (`cfg!(target_os = "macos")`: the Metal renderer is still
+crates.io's). What it does:
+
+- An isolated content-filter group composites through its boundary's mask
+  fade (mask groups, `BlurUniforms::with_edge_fade`) and its transform
+  (transform groups, `BlurUniforms::with_transform`), as
+  ../gpui-ce-windows/src/directx_renderer.rs `dx_blur_and_composite` does.
+  `BlurUniforms` keeps its 112 bytes (the assert in filters.rs holds).
+- Backdrop filters and every other caller keep `blur_and_composite`
+  unchanged (no extras).
+
+Written against the 0.3.0 sources on Windows; first built in WSL on
+2026-11-15 (see the shell notes in docs/parity-big-picture.md).
+
+diff --git a/src/wgpu_renderer/filters.rs b/src/wgpu_renderer/filters.rs
+--- a/src/wgpu_renderer/filters.rs
++++ b/src/wgpu_renderer/filters.rs
+@@ -1,4 +1,4 @@
+-use gpui::{Bounds, Corners, ScaledPixels, point, size};
++use gpui::{Bounds, ContentMask, Corners, GroupTransform, ScaledPixels, point, size};
+ use gpui_render::shaders::interface as shader_interface;
+ use gpui_render::{
+     blur::{
+@@ -12,6 +12,17 @@ use super::{WgpuRenderer, begin_color_render_pass, pipelines};
+
+ pub(super) const FILTER_UNIFORMS_PER_COMPOSITE: u64 = 4;
+
++/// Hydra patch: what an isolated content-filter group adds to its composite:
++/// a mask group's mask (window space, faded at the composite) and a transform
++/// group's transform.
++#[derive(Clone, Copy, Default)]
++pub(super) struct CompositeExtras<'a> {
++    pub(super) mask: Option<&'a ContentMask<ScaledPixels>>,
++    pub(super) transform: Option<&'a GroupTransform>,
++}
++
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+ pub(super) struct FrameUniformRequirements {
+     pub(super) filter_count: u64,
+@@ -58,10 +69,22 @@ impl WgpuRenderer {
+     pub(super) fn blur_and_composite(
+         &self,
+         encoder: &mut wgpu::CommandEncoder,
+         source: &wgpu::TextureView,
+         target: &wgpu::TextureView,
+         parameters: FilterCompositeParameters,
+     ) {
++        self.blur_and_composite_group(encoder, source, target, parameters, CompositeExtras::default());
++    }
++
++    /// Hydra patch: [`WgpuRenderer::blur_and_composite`] with a group's extras.
++    pub(super) fn blur_and_composite_group(
++        &self,
++        encoder: &mut wgpu::CommandEncoder,
++        source: &wgpu::TextureView,
++        target: &wgpu::TextureView,
++        parameters: FilterCompositeParameters,
++        extras: CompositeExtras<'_>,
++    ) {
+         if parameters.blur_radius <= 0.0
+             && matches!(parameters.clip, FilterCompositeClip::RoundedBounds)
+         {
+@@ -71,7 +94,7 @@ impl WgpuRenderer {
+         let full_size = [self.target.width() as f32, self.target.height() as f32];
+
+         let Some(kernel) = BlurKernel::for_radius(parameters.blur_radius) else {
+-            self.composite_texture(encoder, source, target, parameters, full_size);
++            self.composite_texture(encoder, source, target, parameters, full_size, extras);
+
+             return;
+         };
+@@ -136,7 +159,7 @@ impl WgpuRenderer {
+             Some(scissor),
+         );
+
+-        self.composite_texture(encoder, &horizontal_target, target, parameters, blur_size);
++        self.composite_texture(encoder, &horizontal_target, target, parameters, blur_size, extras);
+     }
+
+     fn composite_texture(
+@@ -145,6 +168,7 @@ impl WgpuRenderer {
+         target: &wgpu::TextureView,
+         parameters: FilterCompositeParameters,
+         source_size: [f32; 2],
++        extras: CompositeExtras<'_>,
+     ) {
+         let clips_to_bounds = matches!(parameters.clip, FilterCompositeClip::RoundedBounds);
+         let composite_bounds = if clips_to_bounds {
+@@ -154,7 +178,7 @@ impl WgpuRenderer {
+                 GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * parameters.blur_radius,
+             ))
+         };
+-        let uniforms = BlurUniforms::composite(
++        let mut uniforms = BlurUniforms::composite(
+             composite_bounds,
+             parameters.content_mask,
+             parameters.corner_radii,
+@@ -164,6 +188,36 @@ impl WgpuRenderer {
+             source_size,
+             [self.target.width() as f32, self.target.height() as f32],
+         );
++        // Hydra patch: a mask group's fade (see gpui-ce-windows'
++        // `dx_blur_and_composite`)
++        if let Some(mask) = extras.mask {
++            let (start, fade) = (mask.fade_start, mask.fade_out);
++            let fades = fade.left.0 > 0.0
++                || fade.right.0 > 0.0
++                || fade.top.0 > 0.0
++                || fade.bottom.0 > 0.0;
++            if fades {
++                let inner = Bounds::from_corners(
++                    point(
++                        mask.bounds.left() + start.left.max(ScaledPixels(0.)),
++                        mask.bounds.top() + start.top.max(ScaledPixels(0.)),
++                    ),
++                    point(
++                        mask.bounds.right() - start.right.max(ScaledPixels(0.)),
++                        mask.bounds.bottom() - start.bottom.max(ScaledPixels(0.)),
++                    ),
++                );
++                uniforms = uniforms
++                    .with_edge_fade(inner, [fade.left.0, fade.right.0, fade.top.0, fade.bottom.0]);
++            }
++        }
++        // Hydra patch: a transform group, sampled through its inverse
++        if let Some(group) = extras.transform
++            && let Some(inverse) = group.matrix.inverse()
++        {
++            let [tx, ty] = inverse.translation;
++            uniforms = uniforms.with_transform(inverse.rotation_scale, [tx, ty], group.source);
++        }
+         let resources = self.resources();
+         let pipeline = if uniforms.corner_smoothing > 0.0 {
+             &resources.pipelines.smoothed_blur_composite
+diff --git a/src/wgpu_renderer/frame.rs b/src/wgpu_renderer/frame.rs
+--- a/src/wgpu_renderer/frame.rs
++++ b/src/wgpu_renderer/frame.rs
+@@ -517,7 +517,7 @@
+                     drop(pass);
+                     let (filtered, parent) = self.targets.exit();
+                     let boundary = &self.scene.filter_boundaries[*boundary_index];
+-                    self.renderer.blur_and_composite(
++                    self.renderer.blur_and_composite_group(
+                         &mut self.encoder,
+                         &filtered,
+                         parent,
+@@ -530,6 +530,10 @@
+                             opacity: boundary.opacity,
+                             clip: FilterCompositeClip::ContentShape,
+                         },
++                        super::filters::CompositeExtras {
++                            mask: Some(&boundary.content_mask),
++                            transform: boundary.transform.as_ref(),
++                        },
+                     );
+                     pass = begin_scene_render_pass(
+                         self.renderer,
