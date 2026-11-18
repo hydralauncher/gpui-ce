@@ -417,6 +417,18 @@ its pixels bled the same way at its edges. An upright, unscaled sprite
 samples texel centres, which the clamp leaves as they are. The edge fade for
 scaled or rotated elements is unchanged.
 
+### Clips inside element transforms are not snapped (2026-11-18)
+
+`src/window.rs`: `Window::snapped_content_mask` grows the clip to whole
+device pixels (`cover_bounds`) in the current element space. Inside an
+element transform that space is the window shifted or scaled by a fraction of
+a pixel, so the grown clip landed up to 1 device px past the real clip on
+screen, a different px as the offset moved: a translated carousel track lit
+the column just past its viewport, and a drifting hero art the row and column
+just outside the hero, flickering. Inside a transform the clip is now the
+exact mask (`with_element_transform` already maps it exactly); untransformed
+content is snapped as before.
+
 ### Outer shadows stop at the element (2026-11-12)
 
 `src/shaders/shadows.rs`: `shadow_coverage` and `smoothed_shadow_coverage`

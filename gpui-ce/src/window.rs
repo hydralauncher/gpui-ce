@@ -4517,6 +4517,9 @@ impl Window {
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         let mask = self.content_mask();
+        if !self.element_transform().is_unit() {
+            return mask.scale(self.scale_factor());
+        }
         ContentMask {
             bounds: self.cover_bounds(mask.bounds),
             fade_out: mask.fade_out.scale(self.scale_factor()),
