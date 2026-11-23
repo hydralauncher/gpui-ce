@@ -780,6 +780,9 @@ Apache-2.0 license file copied from gpui-ce-windows), used through
   paragraph gets `overflow-wrap: break-word`. Parley's default (`normal`)
   never split a word, so a long unbroken run ("aaaa...", a URL) in a
   wrapping text area or label ran past its right edge on one line. With
-  `break-word` a word only splits when it alone can't fit the line, and
-  min-content sizing is unchanged (that is what `anywhere` would alter), so
-  text that already fit lays out the same (2026-11-23).
+  `break-word` a word only splits when it alone can't fit the line, so text
+  that already fit lays out the same. Parley takes break-word opportunities
+  even at a zero line width, which is how GPUI measures min-content, so a
+  zero wrap width breaks at the paragraph's min-content width
+  (`calculate_content_widths().min`, which ignores break-word as CSS does)
+  instead of after every character (2026-11-23).
