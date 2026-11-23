@@ -20,7 +20,8 @@ use parley::{
     Affinity, Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor,
     FontContext, FontFamily, FontFamilyName, FontFeature, FontFeatures, FontStyle,
     FontVariation as ParleyFontVariation, FontWeight, GenericFamily, InlineBox, InlineBoxKind,
-    Layout, LayoutContext, Line, LineHeight, PositionedLayoutItem, Selection, StyleProperty,
+    Layout, LayoutContext, Line, LineHeight, OverflowWrap, PositionedLayoutItem, Selection,
+    StyleProperty,
 };
 use skrifa::instance::NormalizedCoord;
 use std::{
@@ -1867,6 +1868,7 @@ impl ParleyTextSystem {
             let mut builder = layout_context.ranged_builder(font_context, text, 1.0, false);
             builder.set_line_break_override(Some(CHROMIUM_LINE_BREAK_OVERRIDE));
             builder.push_default(StyleProperty::FontSize(f32::from(font_size)));
+            builder.push_default(StyleProperty::OverflowWrap(OverflowWrap::BreakWord));
 
             let default_optical_settings = self.automatic_optical_sizing.then(|| {
                 [ParleyFontVariation::new(
@@ -1992,6 +1994,11 @@ impl ParleyTextSystem {
         };
 
         if let Some((wrap_width, max_lines)) = wrap {
+            let wrap_width = if wrap_width <= Pixels::ZERO {
+                px(layout.calculate_content_widths().min)
+            } else {
+                wrap_width
+            };
             if let Some(max_lines) = max_lines {
                 let mut breaker = layout.break_lines();
                 breaker.state_mut().set_layout_max_advance(f32::MAX);
@@ -4343,6 +4350,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn long_word_splits_at_a_positive_width_and_keeps_its_min_content_width() {
+        let system = test_system();
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runs = [text_run(text, IBM_PLEX.family)];
+        let unwrapped = layout_line(&system, text, px(14.0), &runs);
+        let half = unwrapped.width / 2.0;
+
+        let split = layout_wrapped(&system, text, px(14.0), &runs, half, None);
+        assert!(split.visual_lines.len() >= 2);
+        assert!(split.width <= half);
+
+        let min_content = layout_wrapped(&system, text, px(14.0), &runs, Pixels::ZERO, None);
+        assert_eq!(min_content.visual_lines.len(), 1);
+        assert_eq!(min_content.width, unwrapped.width);
+    }
     #[test]
     fn paragraph_caches_preserve_shaping_across_widths_and_edits() {
         let system = test_system();

@@ -448,6 +448,15 @@ Same license as gpui-ce (Apache-2.0, `LICENSE-APACHE` here).
 Patches (the review and comment editor, `hydra-gpui/src/components/rich_editor.rs`,
 edits rich text in one field the way Electron's TipTap editor does):
 
+- `src/editable_text/element.rs` (the measure callback): the shaped-layout
+  cache compares against the layout the state holds now, not the snapshot
+  taken when the element was built. Taffy measures a text area more than
+  once per frame (min-content, then its width) and each measure stores its
+  layout; with the snapshot, every other frame the width measure hit the
+  cache and returned without storing, so the min-content layout was painted.
+  With break-word those two layouts differ for a long word, and a wrapped
+  chat input flickered between one line and several (2026-11-23).
+
 - `src/editable_text/element.rs`: `EditableTextElement::text_highlights`
   lays `HighlightStyle`s over byte ranges of the text (bold, italic,
   underline, strikethrough, code). The field shaped its text as one run;
@@ -776,3 +785,13 @@ Apache-2.0 license file copied from gpui-ce-windows), used through
   "LB" at 11px with 0.44px spacing measured 14.59 against Chromium's 14.16
   (the settings tab row 0.88px wider, its content 0.44px left). Text
   without letter spacing is unchanged (2026-11-15).
+- `src/text_system.rs` (the paragraph builder, every window): every
+  paragraph gets `overflow-wrap: break-word`. Parley's default (`normal`)
+  never split a word, so a long unbroken run ("aaaa...", a URL) in a
+  wrapping text area or label ran past its right edge on one line. With
+  `break-word` a word only splits when it alone can't fit the line, so text
+  that already fit lays out the same. Parley takes break-word opportunities
+  even at a zero line width, which is how GPUI measures min-content, so a
+  zero wrap width breaks at the paragraph's min-content width
+  (`calculate_content_widths().min`, which ignores break-word as CSS does)
+  instead of after every character (2026-11-23).
