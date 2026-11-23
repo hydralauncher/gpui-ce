@@ -20,7 +20,8 @@ use parley::{
     Affinity, Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor,
     FontContext, FontFamily, FontFamilyName, FontFeature, FontFeatures, FontStyle,
     FontVariation as ParleyFontVariation, FontWeight, GenericFamily, InlineBox, InlineBoxKind,
-    Layout, LayoutContext, Line, LineHeight, PositionedLayoutItem, Selection, StyleProperty,
+    Layout, LayoutContext, Line, LineHeight, OverflowWrap, PositionedLayoutItem, Selection,
+    StyleProperty,
 };
 use skrifa::instance::NormalizedCoord;
 use std::{
@@ -1867,6 +1868,7 @@ impl ParleyTextSystem {
             let mut builder = layout_context.ranged_builder(font_context, text, 1.0, false);
             builder.set_line_break_override(Some(CHROMIUM_LINE_BREAK_OVERRIDE));
             builder.push_default(StyleProperty::FontSize(f32::from(font_size)));
+            builder.push_default(StyleProperty::OverflowWrap(OverflowWrap::BreakWord));
 
             let default_optical_settings = self.automatic_optical_sizing.then(|| {
                 [ParleyFontVariation::new(

@@ -776,3 +776,10 @@ Apache-2.0 license file copied from gpui-ce-windows), used through
   "LB" at 11px with 0.44px spacing measured 14.59 against Chromium's 14.16
   (the settings tab row 0.88px wider, its content 0.44px left). Text
   without letter spacing is unchanged (2026-11-15).
+- `src/text_system.rs` (the paragraph builder, every window): every
+  paragraph gets `overflow-wrap: break-word`. Parley's default (`normal`)
+  never split a word, so a long unbroken run ("aaaa...", a URL) in a
+  wrapping text area or label ran past its right edge on one line. With
+  `break-word` a word only splits when it alone can't fit the line, and
+  min-content sizing is unchanged (that is what `anywhere` would alter), so
+  text that already fit lays out the same (2026-11-23).
