@@ -448,6 +448,15 @@ Same license as gpui-ce (Apache-2.0, `LICENSE-APACHE` here).
 Patches (the review and comment editor, `hydra-gpui/src/components/rich_editor.rs`,
 edits rich text in one field the way Electron's TipTap editor does):
 
+- `src/editable_text/element.rs` (the measure callback): the shaped-layout
+  cache compares against the layout the state holds now, not the snapshot
+  taken when the element was built. Taffy measures a text area more than
+  once per frame (min-content, then its width) and each measure stores its
+  layout; with the snapshot, every other frame the width measure hit the
+  cache and returned without storing, so the min-content layout was painted.
+  With break-word those two layouts differ for a long word, and a wrapped
+  chat input flickered between one line and several (2026-11-23).
+
 - `src/editable_text/element.rs`: `EditableTextElement::text_highlights`
   lays `HighlightStyle`s over byte ranges of the text (bold, italic,
   underline, strikethrough, code). The field shaped its text as one run;

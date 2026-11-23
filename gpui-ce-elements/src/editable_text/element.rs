@@ -788,11 +788,15 @@ impl PrelayoutState {
                     unicode_bidi,
                 };
 
-                if let Some(size) = self.prev_layout_state.size
+                let stored = {
+                    let data = &self.state.read(cx).layout_data;
+                    (data.state, data.layout_key.clone())
+                };
+                if let Some(size) = stored.0.size
                     && truncation.width.is_none()
-                    && self.storage_version == self.prev_layout_state.last_seen_storage_version
-                    && self.prev_layout_state.options == options
-                    && self.prev_layout_key.as_ref() == Some(&layout_key)
+                    && self.storage_version == stored.0.last_seen_storage_version
+                    && stored.0.options == options
+                    && stored.1.as_ref() == Some(&layout_key)
                 {
                     return size;
                 }
