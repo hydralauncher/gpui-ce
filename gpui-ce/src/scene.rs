@@ -1091,8 +1091,11 @@ impl Primitive {
                 path.content_mask = transform.apply_to_mask(path.content_mask);
             }
             Primitive::Surface(surface) => {
+                let scale = transform.scale_magnitude();
                 surface.bounds = transformed_bounds(surface.bounds, transform);
                 surface.content_mask = transform.apply_to_mask(surface.content_mask);
+                // Hydra patch: the corners scale with the box, as a filter's do.
+                surface.corner_radii = surface.corner_radii.map(|radius| *radius * scale);
             }
             Primitive::BackdropFilter(filter) => {
                 let scale = transform.scale_magnitude();

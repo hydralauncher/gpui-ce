@@ -384,7 +384,9 @@ the GPU as NV12; this does the same.
   `SurfaceSource::size` made public.
 - `src/scene.rs` + `src/window.rs`: `PaintSurface::corner_radii`, set by the
   new `Window::paint_rounded_surface` (clamped and scaled as
-  `paint_image` does); `paint_surface` passes none. `PaintSurface::opacity`
+  `paint_image` does); `paint_surface` passes none. The radii scale with an
+  element transform, as a filter's do. A `surface()` whose source has no size
+  yet (an empty slot) fills its element instead of fitting into a zero box. `PaintSurface::opacity`
   takes the element opacity (`Primitive::fade`), as a sprite does; surfaces
   ignored it before.
 - `src/platform/windows_video_frame.rs` + `src/window.rs`:
@@ -543,7 +545,10 @@ The crates.io release (src, Cargo.toml, LICENSE), used through
   inside the content mask), not over the whole window. Each backdrop or
   content blur used to downsample and blur the entire window; with the
   scissor the passes no longer clear their targets, since they overwrite
-  every texel the next pass reads.
+  every texel the next pass reads. Blur passes and surfaces sample through a
+  clamped sampler (the shared one wraps): a tap past an edge read the
+  opposite edge, stale under the scissor, and a video's frame bled its
+  opposite edge into a 1px border.
 
 ## gpui_ce_wgpu 0.3.0 (`../gpui-ce-wgpu`)
 

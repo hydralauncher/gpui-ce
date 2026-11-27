@@ -149,6 +149,15 @@ struct CachedVideoTexture {
     last_drawn: u64,
 }
 
+/// Window pixels added to a blur kernel's reach (3 sigma) when scissoring its passes, so the
+/// rounding of half-resolution coordinates never cuts a tap.
+const BLUR_REACH_SLACK: f32 = 4.0;
+/// The scissored passes that read past their own output: the vertical pass reads the
+/// horizontal one's, which reads the downsample's.
+const BLUR_PASSES_READING_AHEAD: f32 = 2.0;
+/// Window pixels kept around the scissor for the composite's bilinear taps.
+const BLUR_SAMPLE_SLACK: f32 = 4.0;
+
 /// Frames a shared video texture stays open after it was last drawn.
 const VIDEO_TEXTURE_IDLE_FRAMES: u64 = 32;
 /// How long a draw waits for the decoder to release a video texture.
@@ -262,6 +271,10 @@ struct DirectXGlobalElements {
     /// Per-draw [`Dx11DrawConstants`]; rewritten before every instanced draw.
     draw_constants_buffer: ID3D11Buffer,
     sampler: Option<ID3D11SamplerState>,
+    /// Hydra patch: linear and clamped to the edge, for blur passes and surfaces. A wrapping
+    /// read past one edge would pick up the opposite edge (a video's frame, or texels a
+    /// scissored blur pass left stale).
+    clamped_sampler: Option<ID3D11SamplerState>,
 }
 
 impl DirectXGlobalElements {
@@ -1181,7 +1194,7 @@ impl DirectXRenderer {
         let ctx = &devices.device_context;
         let cbuffers = self.globals.cbuffers();
         let surface_cb = [Some(self.pipelines.surfaces.params_buffer.clone())];
-        let sampler = [self.globals.sampler.clone()];
+        let sampler = [self.globals.clamped_sampler.clone()];
 
         let rendered_frame = resources.rendered_frames;
         for surface in surfaces {
@@ -1359,7 +1372,7 @@ impl DirectXRenderer {
             ctx.PSSetConstantBuffers(DATA_REGISTER, Some(&blur_params));
             ctx.PSSetSamplers(
                 PRIMARY_SAMPLER_REGISTER,
-                Some(slice::from_ref(&self.globals.sampler)),
+                Some(slice::from_ref(&self.globals.clamped_sampler)),
             );
             ctx.PSSetShaderResources(PRIMARY_TEXTURE_REGISTER, Some(slice::from_ref(source_srv)));
             ctx.OMSetBlendState(blend, None, 0xFFFFFFFF);
@@ -1429,7 +1442,7 @@ impl DirectXRenderer {
             // (its bounds, dilated by the kernel's reach twice: the vertical pass reads
             // the horizontal one's output that far out, which reads the downsample that
             // far again), not the whole window, once per blur.
-            let reach = GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius + 4.0;
+            let reach = GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius + BLUR_REACH_SLACK;
             let read = if clip_rounded {
                 bounds
             } else {
@@ -1438,8 +1451,10 @@ impl DirectXRenderer {
                 ))
             }
             .intersect(&content_mask.dilate(ScaledPixels(reach)))
-            .dilate(ScaledPixels(2.0 * reach + 4.0));
-            let half = |value: f32, limit: f32| (value / 2.0).clamp(0.0, limit);
+            .dilate(ScaledPixels(BLUR_PASSES_READING_AHEAD * reach + BLUR_SAMPLE_SLACK));
+            // window pixels to the half-resolution scratch textures' pixels
+            let to_scratch = blur_size[0] / full_width as f32;
+            let half = |value: f32, limit: f32| (value * to_scratch).clamp(0.0, limit);
             let scissor = windows::Win32::Foundation::RECT {
                 left: half(read.origin.x.0, blur_size[0]).floor() as i32,
                 top: half(read.origin.y.0, blur_size[1]).floor() as i32,
@@ -1975,12 +1990,12 @@ impl DirectXGlobalElements {
         let draw_constants_buffer =
             create_constant_buffer(device, std::mem::size_of::<Dx11DrawConstants>())?;
 
-        let sampler = unsafe {
+        let linear_sampler = |address: D3D11_TEXTURE_ADDRESS_MODE| -> Result<_> {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
+                AddressU: address,
+                AddressV: address,
+                AddressW: address,
                 MipLODBias: 0.0,
                 MaxAnisotropy: 1,
                 ComparisonFunc: D3D11_COMPARISON_ALWAYS,
@@ -1989,15 +2004,18 @@ impl DirectXGlobalElements {
                 MaxLOD: D3D11_FLOAT32_MAX,
             };
             let mut output = None;
-            device.CreateSamplerState(&desc, Some(&mut output))?;
-            output
+            unsafe { device.CreateSamplerState(&desc, Some(&mut output))? };
+            Ok(output)
         };
+        let sampler = linear_sampler(D3D11_TEXTURE_ADDRESS_WRAP)?;
+        let clamped_sampler = linear_sampler(D3D11_TEXTURE_ADDRESS_CLAMP)?;
 
         Ok(Self {
             globals_buffer: Some(globals_buffer),
             font_buffer: Some(font_buffer),
             draw_constants_buffer,
             sampler,
+            clamped_sampler,
         })
     }
 }

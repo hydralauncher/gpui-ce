@@ -21,6 +21,26 @@ pub mod surface {
     texture!(group(1), binding(2), SURFACE_CHROMA_TEXTURE: Texture2D<f32>);
     sampler!(group(1), binding(3), SURFACE_SAMPLER: Sampler);
 
+    // Hydra patch: limited-range ("video") YCbCr, 8-bit levels in 0-1 units.
+    /// Y's black level (16 / 255).
+    pub const LIMITED_LUMA_BLACK: f32 = 0.0627451;
+    /// Y's scale to full range (255 / 219).
+    pub const LIMITED_LUMA_SCALE: f32 = 1.1643836;
+    /// CbCr's zero (128 / 255).
+    pub const CHROMA_ZERO: f32 = 0.5019608;
+    /// CbCr's scale to full range (255 / 224).
+    pub const LIMITED_CHROMA_SCALE: f32 = 1.1383929;
+    /// BT.709 (HD) YCbCr to R'G'B': Cr into R, Cb and Cr out of G, Cb into B.
+    pub const BT709_CR_TO_R: f32 = 1.5748;
+    pub const BT709_CB_TO_G: f32 = 0.1873243;
+    pub const BT709_CR_TO_G: f32 = 0.4681243;
+    pub const BT709_CB_TO_B: f32 = 1.8556;
+    /// BT.601 (SD) YCbCr to R'G'B'.
+    pub const BT601_CR_TO_R: f32 = 1.402;
+    pub const BT601_CB_TO_G: f32 = 0.3441363;
+    pub const BT601_CR_TO_G: f32 = 0.7141363;
+    pub const BT601_CB_TO_B: f32 = 1.772;
+
     pub const YCBCR_TO_LINEAR_RGB: Mat4x4f = mat4x4f(
         vec4f(1.0000, 1.0000, 1.0000, 0.0),
         vec4f(0.0000, -0.3441, 1.7720, 0.0),
@@ -41,21 +61,21 @@ pub mod surface {
             return YCBCR_TO_LINEAR_RGB * vec4f(luma, chroma.x, chroma.y, 1.0);
         }
         // Hydra patch: limited range (Y 16-235, CbCr 16-240), then the matrix.
-        let y = (luma - 0.0627451) * 1.1643836;
-        let cb = (chroma.x - 0.5019608) * 1.1383929;
-        let cr = (chroma.y - 0.5019608) * 1.1383929;
+        let y = (luma - LIMITED_LUMA_BLACK) * LIMITED_LUMA_SCALE;
+        let cb = (chroma.x - CHROMA_ZERO) * LIMITED_CHROMA_SCALE;
+        let cr = (chroma.y - CHROMA_ZERO) * LIMITED_CHROMA_SCALE;
         if color_format == SurfaceColorFormat::Yuv709Limited {
             return vec4f(
-                saturate(y + 1.5748 * cr),
-                saturate(y - 0.1873243 * cb - 0.4681243 * cr),
-                saturate(y + 1.8556 * cb),
+                saturate(y + BT709_CR_TO_R * cr),
+                saturate(y - BT709_CB_TO_G * cb - BT709_CR_TO_G * cr),
+                saturate(y + BT709_CB_TO_B * cb),
                 1.0,
             );
         }
         vec4f(
-            saturate(y + 1.402 * cr),
-            saturate(y - 0.3441363 * cb - 0.7141363 * cr),
-            saturate(y + 1.772 * cb),
+            saturate(y + BT601_CR_TO_R * cr),
+            saturate(y - BT601_CB_TO_G * cb - BT601_CR_TO_G * cr),
+            saturate(y + BT601_CB_TO_B * cb),
             1.0,
         )
     }

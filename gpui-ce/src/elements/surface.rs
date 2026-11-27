@@ -224,7 +224,14 @@ impl Element for Surface {
         _window: &mut Window,
         _: &mut App,
     ) {
-        let new_bounds = self.object_fit.get_bounds(_bounds, self.source.size());
+        // Hydra patch: a source with no size yet (an empty video slot) fills the element
+        // rather than fitting into a zero-sized box (a division by zero).
+        let size = self.source.size();
+        let new_bounds = if size.width.0 <= 0 || size.height.0 <= 0 {
+            _bounds
+        } else {
+            self.object_fit.get_bounds(_bounds, size)
+        };
         // TODO: Add support for corner_radii.
         let mut style = Style::default();
         style.refine(&self.style);
