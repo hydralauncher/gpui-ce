@@ -12,15 +12,34 @@ pub mod surface {
         pub opacity: f32,
         pub padding0: u32,
         pub padding1: u32,
-        pub padding2: u32,
-        pub padding3: u32,
-        pub padding4: u32,
-        pub padding5: u32,
+        // Hydra patch: rounds the corners of `bounds` (16-byte aligned, as WGSL
+        // and HLSL constant buffers place a struct).
+        pub corner_radii: Corners,
     }
     uniform!(group(1), binding(0), SURFACE_LOCALS: SurfaceUniforms);
     texture!(group(1), binding(1), SURFACE_TEXTURE: Texture2D<f32>);
     texture!(group(1), binding(2), SURFACE_CHROMA_TEXTURE: Texture2D<f32>);
     sampler!(group(1), binding(3), SURFACE_SAMPLER: Sampler);
+
+    // Hydra patch: limited-range ("video") YCbCr, 8-bit levels in 0-1 units.
+    /// Y's black level (16 / 255).
+    pub const LIMITED_LUMA_BLACK: f32 = 0.0627451;
+    /// Y's scale to full range (255 / 219).
+    pub const LIMITED_LUMA_SCALE: f32 = 1.1643836;
+    /// CbCr's zero (128 / 255).
+    pub const CHROMA_ZERO: f32 = 0.5019608;
+    /// CbCr's scale to full range (255 / 224).
+    pub const LIMITED_CHROMA_SCALE: f32 = 1.1383929;
+    /// BT.709 (HD) YCbCr to R'G'B': Cr into R, Cb and Cr out of G, Cb into B.
+    pub const BT709_CR_TO_R: f32 = 1.5748;
+    pub const BT709_CB_TO_G: f32 = 0.1873243;
+    pub const BT709_CR_TO_G: f32 = 0.4681243;
+    pub const BT709_CB_TO_B: f32 = 1.8556;
+    /// BT.601 (SD) YCbCr to R'G'B'.
+    pub const BT601_CR_TO_R: f32 = 1.402;
+    pub const BT601_CB_TO_G: f32 = 0.3441363;
+    pub const BT601_CR_TO_G: f32 = 0.7141363;
+    pub const BT601_CB_TO_B: f32 = 1.772;
 
     pub const YCBCR_TO_LINEAR_RGB: Mat4x4f = mat4x4f(
         vec4f(1.0000, 1.0000, 1.0000, 0.0),
@@ -29,7 +48,7 @@ pub mod surface {
         vec4f(-0.7010, 0.5291, -0.8860, 1.0),
     );
 
-    pub fn sample_yuv_surface(texture_position: Vec2f) -> Vec4f {
+    pub fn sample_yuv_surface(texture_position: Vec2f, color_format: SurfaceColorFormat) -> Vec4f {
         let luma = texture_sample_level(SURFACE_TEXTURE, SURFACE_SAMPLER, texture_position, 0.0).x;
         let chroma = texture_sample_level(
             SURFACE_CHROMA_TEXTURE,
@@ -38,7 +57,27 @@ pub mod surface {
             0.0,
         )
         .xy();
-        YCBCR_TO_LINEAR_RGB * vec4f(luma, chroma.x, chroma.y, 1.0)
+        if color_format == SurfaceColorFormat::Yuv {
+            return YCBCR_TO_LINEAR_RGB * vec4f(luma, chroma.x, chroma.y, 1.0);
+        }
+        // Hydra patch: limited range (Y 16-235, CbCr 16-240), then the matrix.
+        let y = (luma - LIMITED_LUMA_BLACK) * LIMITED_LUMA_SCALE;
+        let cb = (chroma.x - CHROMA_ZERO) * LIMITED_CHROMA_SCALE;
+        let cr = (chroma.y - CHROMA_ZERO) * LIMITED_CHROMA_SCALE;
+        if color_format == SurfaceColorFormat::Yuv709Limited {
+            return vec4f(
+                saturate(y + BT709_CR_TO_R * cr),
+                saturate(y - BT709_CB_TO_G * cb - BT709_CR_TO_G * cr),
+                saturate(y + BT709_CB_TO_B * cb),
+                1.0,
+            );
+        }
+        vec4f(
+            saturate(y + BT601_CR_TO_R * cr),
+            saturate(y - BT601_CB_TO_G * cb - BT601_CR_TO_G * cr),
+            saturate(y + BT601_CB_TO_B * cb),
+            1.0,
+        )
     }
 
     #[derive(Wgsl)]
@@ -70,9 +109,20 @@ pub mod surface {
             return transparent();
         }
         let locals = get!(SURFACE_LOCALS);
-        let fade = ContentMask::alpha(locals.content_mask, input.position.xy());
-        if locals.color_format == SurfaceColorFormat::Yuv {
-            return sample_yuv_surface(input.texture_position) * locals.opacity * fade;
+        let mut fade = ContentMask::alpha(locals.content_mask, input.position.xy());
+        // Hydra patch: rounded corners, antialiased like a quad's.
+        if !Corners::is_zero(locals.corner_radii) {
+            let distance = rounded_rectangle_signed_distance(
+                input.position.xy(),
+                locals.bounds,
+                locals.corner_radii,
+            );
+            fade *= antialiased_coverage(distance);
+        }
+        if locals.color_format != SurfaceColorFormat::Rgba {
+            return sample_yuv_surface(input.texture_position, locals.color_format)
+                * locals.opacity
+                * fade;
         }
         texture_sample_level(
             SURFACE_TEXTURE,

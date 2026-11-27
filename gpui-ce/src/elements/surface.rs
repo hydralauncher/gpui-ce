@@ -1,9 +1,9 @@
-#[cfg(target_os = "windows")]
-use crate::WindowsScreenCaptureFrame;
 use crate::{
     App, Bounds, DevicePixels, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, ObjectFit, Pixels, Size, Style, StyleRefinement, Styled, Window,
 };
+#[cfg(target_os = "windows")]
+use crate::{WindowsScreenCaptureFrame, WindowsVideoFrame, WindowsVideoSlot};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc2_core_foundation::CFRetained;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -42,6 +42,12 @@ pub enum SurfaceSource {
     /// A native Windows Graphics Capture texture.
     #[cfg(target_os = "windows")]
     WindowsCapture(WindowsScreenCaptureFrame),
+    /// Hydra patch: a decoded NV12 video frame in a shared Direct3D 11 texture.
+    #[cfg(target_os = "windows")]
+    WindowsVideo(WindowsVideoFrame),
+    /// Hydra patch: the frame a [`WindowsVideoSlot`] holds when the renderer draws.
+    #[cfg(target_os = "windows")]
+    WindowsVideoSlot(WindowsVideoSlot),
     /// A placeholder for platforms that cannot import native surfaces.
     #[doc(hidden)]
     Unsupported(Size<DevicePixels>),
@@ -64,13 +70,18 @@ impl std::fmt::Debug for SurfaceSource {
                 .finish_non_exhaustive(),
             #[cfg(target_os = "windows")]
             SurfaceSource::WindowsCapture(ref frame) => frame.fmt(_f),
+            #[cfg(target_os = "windows")]
+            SurfaceSource::WindowsVideo(ref frame) => frame.fmt(_f),
+            #[cfg(target_os = "windows")]
+            SurfaceSource::WindowsVideoSlot(ref slot) => slot.fmt(_f),
             SurfaceSource::Unsupported(size) => _f.debug_tuple("Unsupported").field(&size).finish(),
         }
     }
 }
 
 impl SurfaceSource {
-    fn size(&self) -> Size<DevicePixels> {
+    /// The frame's size in device pixels.
+    pub fn size(&self) -> Size<DevicePixels> {
         match self {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             SurfaceSource::Surface(buffer) => crate::size(
@@ -86,6 +97,12 @@ impl SurfaceSource {
             SurfaceSource::Texture { size, .. } => *size,
             #[cfg(target_os = "windows")]
             SurfaceSource::WindowsCapture(frame) => frame.size(),
+            #[cfg(target_os = "windows")]
+            SurfaceSource::WindowsVideo(frame) => frame.size(),
+            #[cfg(target_os = "windows")]
+            SurfaceSource::WindowsVideoSlot(slot) => {
+                slot.current().map(|frame| frame.size()).unwrap_or_default()
+            }
             SurfaceSource::Unsupported(size) => *size,
         }
     }
@@ -102,6 +119,20 @@ impl From<CFRetained<CVPixelBuffer>> for SurfaceSource {
 impl From<WindowsScreenCaptureFrame> for SurfaceSource {
     fn from(value: WindowsScreenCaptureFrame) -> Self {
         SurfaceSource::WindowsCapture(value)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<WindowsVideoSlot> for SurfaceSource {
+    fn from(value: WindowsVideoSlot) -> Self {
+        SurfaceSource::WindowsVideoSlot(value)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<WindowsVideoFrame> for SurfaceSource {
+    fn from(value: WindowsVideoFrame) -> Self {
+        SurfaceSource::WindowsVideo(value)
     }
 }
 
@@ -193,7 +224,14 @@ impl Element for Surface {
         _window: &mut Window,
         _: &mut App,
     ) {
-        let new_bounds = self.object_fit.get_bounds(_bounds, self.source.size());
+        // Hydra patch: a source with no size yet (an empty video slot) fills the element
+        // rather than fitting into a zero-sized box (a division by zero).
+        let size = self.source.size();
+        let new_bounds = if size.width.0 <= 0 || size.height.0 <= 0 {
+            _bounds
+        } else {
+            self.object_fit.get_bounds(_bounds, size)
+        };
         // TODO: Add support for corner_radii.
         let mut style = Style::default();
         style.refine(&self.style);

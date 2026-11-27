@@ -198,6 +198,9 @@ pub(crate) mod frame_stats {
         phases: [Duration; 3],
         /// render time and calls per view type
         views: HashMap<&'static str, (Duration, u32)>,
+        /// who asked for frames: `request_animation_frame` and `notify` call
+        /// sites, with their counts
+        sources: HashMap<(&'static str, &'static std::panic::Location<'static>), u32>,
     }
 
     thread_local! {
@@ -208,6 +211,21 @@ pub(crate) mod frame_stats {
     /// The draw phases of the frame being drawn.
     pub fn set_phases(phases: [Duration; 3]) {
         PHASES.with(|p| p.set(phases));
+    }
+
+    /// A frame request from `location` (`kind`: "raf" or "notify"), counted
+    /// for the summary's "requests" list: what keeps a settled window drawing.
+    pub fn record_source(kind: &'static str, location: &'static std::panic::Location<'static>) {
+        if !enabled() {
+            return;
+        }
+        STATS.with(|stats| {
+            *stats
+                .borrow_mut()
+                .sources
+                .entry((kind, location))
+                .or_default() += 1;
+        });
     }
 
     /// One view's render (its own element tree, not its child views').
@@ -260,10 +278,20 @@ pub(crate) mod frame_stats {
                         format!("{short} {:.2}ms x{:.1}", per_frame(*total), *calls as f64 / frames as f64)
                     })
                     .collect();
+                let mut sources: Vec<_> = stats.sources.iter().collect();
+                sources.sort_by(|a, b| b.1.cmp(a.1));
+                let sources: Vec<String> = sources
+                    .iter()
+                    .take(6)
+                    .map(|((kind, at), count)| {
+                        format!("{kind} {}:{} x{:.1}", at.file(), at.line(), **count as f64 / frames as f64)
+                    })
+                    .collect();
                 eprintln!(
-                    "[frame-stats] {frames} frames in {:.1}s | draw ms {draw} | present ms {present} | per frame: request_layout {layout:.2} prepaint {prepaint:.2} paint {paint:.2} | renders: {}",
+                    "[frame-stats] {frames} frames in {:.1}s | draw ms {draw} | present ms {present} | per frame: request_layout {layout:.2} prepaint {prepaint:.2} paint {paint:.2} | renders: {} | requests: {}",
                     elapsed.as_secs_f64(),
-                    views.join(", ")
+                    views.join(", "),
+                    sources.join(", ")
                 );
                 *stats = Window::default();
             }
@@ -3347,7 +3375,9 @@ impl Window {
     /// # let mut window = app.open_window(|_, _| Root);
     /// window.update(|_, window, _| window.refresh());
     /// ```
+    #[track_caller]
     pub fn refresh(&mut self) {
+        frame_stats::record_source("refresh", std::panic::Location::caller());
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
@@ -3791,7 +3821,13 @@ impl Window {
     /// });
     /// assert!(ran.get());
     /// ```
+    #[track_caller]
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        frame_stats::record_source("next_frame", std::panic::Location::caller());
+        self.schedule_next_frame(callback);
+    }
+
+    fn schedule_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
         self.platform_window.schedule_frame();
         // Next-frame callbacks create frame demand without dirtying the
@@ -3815,11 +3851,22 @@ impl Window {
     ///
     /// Panics if no view is being rendered or painted. Use [`Window::on_next_frame`]
     /// instead when you aren't inside a view.
+    #[track_caller]
     pub fn request_animation_frame(&self) {
+        frame_stats::record_source("raf", std::panic::Location::caller());
         let entity = self.current_view();
         // The next draw rebuilds this view even if it runs before the frame callback does.
         self.invalidator.mark_dirty_for_next_draw(entity);
-        self.on_next_frame(move |_, cx| cx.notify(entity));
+        self.schedule_next_frame(move |_, cx| cx.notify(entity));
+    }
+
+    /// Hydra patch: draws the window's last scene again on the next frame, with no render,
+    /// layout or paint. For content the scene reads when it is drawn, such as a
+    /// [`crate::WindowsVideoSlot`] that got a new frame.
+    pub fn request_present(&self) {
+        self.needs_present.set(true);
+        self.platform_window.schedule_frame();
+        self.invalidator.wake_platform();
     }
 
     /// Runs the callbacks scheduled with [`Window::on_next_frame`] and returns how many ran.
@@ -7457,14 +7504,30 @@ impl Window {
         bounds: Bounds<Pixels>,
         source: impl Into<crate::SurfaceSource>,
     ) {
+        self.paint_rounded_surface(bounds, Corners::default(), source);
+    }
+
+    /// Hydra patch: [`Window::paint_surface`] with `corner_radii` rounding the corners of
+    /// `bounds`, as [`Window::paint_image`] rounds an image's.
+    pub fn paint_rounded_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        source: impl Into<crate::SurfaceSource>,
+    ) {
         self.invalidator.debug_assert_paint();
 
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size)
+            .scale(self.scale_factor());
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            corner_radii,
+            opacity: 1.0,
             source: source.into(),
         });
     }

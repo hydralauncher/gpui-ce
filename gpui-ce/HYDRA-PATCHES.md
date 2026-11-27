@@ -33,6 +33,10 @@ Patches:
   present times on the UI thread (mean, p50, p95, max), for the
   measurements in `docs/performance.md`. Off, it costs one cached env check
   per frame.
+  It also lists what asked for those frames: the call sites of
+  `request_animation_frame`, `on_next_frame`, `refresh` and `notify`
+  (`#[track_caller]` on them and on `App`'s `notify`), with how many times
+  per frame, so a window that never settles names its cause.
 
 ### Element transforms and edge masks (2026-11-11)
 
@@ -364,6 +368,36 @@ modal was gone, where Electron's backdrop clears as it fades.
   strength at once). The renderers already multiply `BackdropFilter::opacity`
   into the composite.
 
+### Video frames on the GPU, Windows (2026-11-27)
+
+Hydra's trailers decoded on the GPU (D3D11VA), then copied each frame back
+to system memory, converted it to BGRA on the CPU and uploaded it to the
+sprite atlas as a new image. Discord's GPUI client (Phoenix) keeps frames on
+the GPU as NV12; this does the same.
+
+- `src/platform/windows_video_frame.rs`: `WindowsVideoFrame`, an NV12
+  texture another Direct3D 11 device shares through an NT handle and a keyed
+  mutex (key 0 on both sides), with a cache id, its size, its
+  `VideoColorSpace` (BT.709 or BT.601, limited or full range) and a
+  keepalive the producer drops when the scene no longer shows it.
+- `src/elements/surface.rs`: `SurfaceSource::WindowsVideo` and
+  `SurfaceSource::size` made public.
+- `src/scene.rs` + `src/window.rs`: `PaintSurface::corner_radii`, set by the
+  new `Window::paint_rounded_surface` (clamped and scaled as
+  `paint_image` does); `paint_surface` passes none. The radii scale with an
+  element transform, as a filter's do. A `surface()` whose source has no size
+  yet (an empty slot) fills its element instead of fitting into a zero box. `PaintSurface::opacity`
+  takes the element opacity (`Primitive::fade`), as a sprite does; surfaces
+  ignored it before.
+- `src/platform/windows_video_frame.rs` + `src/window.rs`:
+  `WindowsVideoSlot`, the frame a video shows now
+  (`SurfaceSource::WindowsVideoSlot`), read by the renderer when it draws,
+  and `Window::request_present`, which draws the last scene again with no
+  render, layout or paint (GPUI's existing `needs_present` path). A player
+  paints its slot once; each new frame goes into the slot and only presents.
+  Hydra's game page re-rendered (render, layout, paint of the whole page) for
+  every trailer frame: the process went from 24% to 9% of a core.
+
 ## gpui_ce_render 0.3.0 (`../gpui-ce-render`)
 
 The crates.io release (src, build.rs, Cargo.toml), used through
@@ -400,6 +434,15 @@ PNG with pixel checks) and `HYDRA_DEV_TRANSFORMS=1` in the app (Linux under
 Xvfb). macOS: Naga generates the MSL on every build (from the module that
 validated), and the Metal renderer compiles it at startup; nobody has run
 it on a Mac yet.
+
+### Surfaces: NV12 color spaces and rounded corners (2026-11-27)
+
+- `src/shaders/common.rs` + `filters.rs`: `SurfaceColorFormat` adds
+  `Yuv709Limited` and `Yuv601Limited` (the existing `Yuv` stays BT.601 full
+  range for CoreVideo). `SurfaceUniforms` replaces four padding words with
+  `corner_radii` (16-byte aligned, the same size); the fragment shader
+  multiplies in a rounded-rectangle coverage when a radius is set.
+- `src/shaders/interface.rs`: the layout table follows.
 
 ### Sprites sample inside their atlas tile (2026-11-12)
 
@@ -488,6 +531,24 @@ The crates.io release (src, Cargo.toml, LICENSE), used through
   Chromium's LCD text in Big Picture: the edges now carry the same colours
   as Electron's. Only windows that draw subpixel text see it (Big Picture's
   LCD rule; the main window is grayscale).
+
+- `src/directx_renderer.rs` (2026-11-27): draws
+  `SurfaceSource::WindowsVideo`. The shared texture opens once per id
+  (`OpenSharedResource1`, an R8 view of the Y plane and an R8G8 view of the
+  CbCr plane) and closes 32 frames after it was last drawn, since a player
+  rotates a small pool. Each draw holds the keyed mutex (50 ms at most; a
+  frame still being written is skipped) and passes the frame's color space
+  and corner radii.
+- `src/directx_renderer.rs` (2026-11-27): a blur's downsample and gaussian
+  passes run under a scissor rectangle, the half-resolution region its
+  composite reads (the composite box, dilated by twice the kernel's reach,
+  inside the content mask), not over the whole window. Each backdrop or
+  content blur used to downsample and blur the entire window; with the
+  scissor the passes no longer clear their targets, since they overwrite
+  every texel the next pass reads. Blur passes and surfaces sample through a
+  clamped sampler (the shared one wraps): a tap past an edge read the
+  opposite edge, stale under the scissor, and a video's frame bled its
+  opposite edge into a 1px border.
 
 ## gpui_ce_wgpu 0.3.0 (`../gpui-ce-wgpu`)
 

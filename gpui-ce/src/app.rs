@@ -3997,7 +3997,9 @@ impl AppContext for App {
         read(entity, self)
     }
 
+    #[track_caller]
     fn notify(&mut self, entity_id: EntityId) {
+        crate::window::frame_stats::record_source("notify", std::panic::Location::caller());
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)
