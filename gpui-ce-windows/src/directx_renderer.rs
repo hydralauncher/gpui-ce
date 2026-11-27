@@ -1451,15 +1451,22 @@ impl DirectXRenderer {
                 ))
             }
             .intersect(&content_mask.dilate(ScaledPixels(reach)))
-            .dilate(ScaledPixels(BLUR_PASSES_READING_AHEAD * reach + BLUR_SAMPLE_SLACK));
-            // window pixels to the half-resolution scratch textures' pixels
-            let to_scratch = blur_size[0] / full_width as f32;
-            let half = |value: f32, limit: f32| (value * to_scratch).clamp(0.0, limit);
+            .dilate(ScaledPixels(
+                BLUR_PASSES_READING_AHEAD * reach + BLUR_SAMPLE_SLACK,
+            ));
+            // window pixels to the half-resolution scratch textures' pixels, per axis
+            // (each dimension is rounded up on its own)
+            let to_scratch = [
+                blur_size[0] / full_width as f32,
+                blur_size[1] / full_height as f32,
+            ];
+            let half =
+                |value: f32, axis: usize| (value * to_scratch[axis]).clamp(0.0, blur_size[axis]);
             let scissor = windows::Win32::Foundation::RECT {
-                left: half(read.origin.x.0, blur_size[0]).floor() as i32,
-                top: half(read.origin.y.0, blur_size[1]).floor() as i32,
-                right: half((read.origin.x + read.size.width).0, blur_size[0]).ceil() as i32,
-                bottom: half((read.origin.y + read.size.height).0, blur_size[1]).ceil() as i32,
+                left: half(read.origin.x.0, 0).floor() as i32,
+                top: half(read.origin.y.0, 1).floor() as i32,
+                right: half((read.origin.x + read.size.width).0, 0).ceil() as i32,
+                bottom: half((read.origin.y + read.size.height).0, 1).ceil() as i32,
             };
             if scissor.right <= scissor.left || scissor.bottom <= scissor.top {
                 return Ok(());
