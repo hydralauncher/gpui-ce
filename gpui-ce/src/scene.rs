@@ -1051,6 +1051,8 @@ impl Primitive {
             Primitive::MonochromeSprite(p) => p.color.a *= factor,
             Primitive::SubpixelSprite(p) => p.color.a *= factor,
             Primitive::PolychromeSprite(p) => p.opacity *= factor,
+            // Hydra patch: a video frame fades like an image.
+            Primitive::Surface(p) => p.opacity *= factor,
             // Hydra patch: a fading element's backdrop blur fades with it, as
             // CSS composites the filtered backdrop inside the element's group.
             Primitive::BackdropFilter(p) => p.opacity *= factor,
@@ -2198,6 +2200,10 @@ pub struct PaintSurface {
     pub bounds: Bounds<ScaledPixels>,
     /// The region that clips this surface.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Hydra patch: rounds the corners of `bounds`, in scaled pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Hydra patch: the element opacity, multiplied in as for a sprite.
+    pub opacity: f32,
     /// Where the pixels come from.
     pub source: crate::SurfaceSource,
 }
@@ -2683,6 +2689,8 @@ mod tests {
             order: 0,
             bounds: full_bounds(),
             content_mask: mask(),
+            corner_radii: Corners::default(),
+            opacity: 1.0,
             source: SurfaceSource::Unsupported(Size::default()),
         }
     }

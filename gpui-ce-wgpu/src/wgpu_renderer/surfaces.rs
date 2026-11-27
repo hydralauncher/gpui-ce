@@ -132,13 +132,10 @@ impl WgpuRenderer {
             bounds: surface.bounds.into(),
             content_mask: surface.content_mask.into(),
             color_format,
-            opacity: 1.0,
+            opacity: surface.opacity,
             padding0: 0,
             padding1: 0,
-            padding2: 0,
-            padding3: 0,
-            padding4: 0,
-            padding5: 0,
+            corner_radii: surface.corner_radii.into(),
         };
         let resources = self.resources();
         let uniform_offset = resources.surface_uniforms.write(&uniforms);

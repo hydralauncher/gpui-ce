@@ -93,7 +93,13 @@ mod source {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
     pub enum SurfaceColorFormat {
         Rgba = 0,
+        /// BT.601 full range (CoreVideo's biplanar buffers).
         Yuv = 1,
+        // Hydra patch: decoded NV12 video (`SurfaceSource::WindowsVideo`).
+        /// BT.709, limited range.
+        Yuv709Limited = 2,
+        /// BT.601, limited range.
+        Yuv601Limited = 3,
     }
 
     #[repr(u32)]

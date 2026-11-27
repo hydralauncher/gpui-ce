@@ -405,6 +405,7 @@ impl<'a, T: 'static> Context<'a, T> {
     /// ```
     ///
     /// See [ownership and data flow](crate::_documentation::concepts::ownership).
+    #[track_caller]
     pub fn notify(&mut self) {
         self.app.notify(self.entity_state.entity_id);
     }
@@ -1211,7 +1212,7 @@ impl<T> AppContext for Context<'_, T> {
         self.app.read_entity(handle, read)
     }
 
-    #[inline]
+    #[track_caller]
     fn notify(&mut self, entity_id: EntityId) {
         self.app.notify(entity_id)
     }

@@ -120,6 +120,7 @@ impl AppContext for AsyncApp {
         lock.read_entity(handle, callback)
     }
 
+    #[track_caller]
     fn notify(&mut self, entity_id: EntityId) {
         let app = self.app();
         let mut lock = app.borrow_mut();
@@ -666,6 +667,7 @@ impl AppContext for AsyncWindowContext {
         self.app.read_entity(handle, read)
     }
 
+    #[track_caller]
     fn notify(&mut self, entity_id: EntityId) {
         self.app.notify(entity_id);
     }

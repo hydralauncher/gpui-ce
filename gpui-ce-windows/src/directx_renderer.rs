@@ -106,6 +106,9 @@ pub(crate) struct DirectXRendererDevices {
 struct DirectXResources {
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
+    // The default rasterizer state, and the same with the scissor test (blur passes).
+    rasterizer: ID3D11RasterizerState,
+    scissor_rasterizer: ID3D11RasterizerState,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -119,6 +122,12 @@ struct DirectXResources {
     // underlying texture alive makes its COM pointer a stable cache key.
     surface_views: FxHashMap<usize, CachedSurfaceView>,
 
+    // Hydra patch: shared video textures opened on this device, by `WindowsVideoFrame::id`.
+    // A player rotates a small pool, so entries stay while they were drawn recently.
+    video_textures: FxHashMap<u64, CachedVideoTexture>,
+    // Frames rendered, the clock for `CachedVideoTexture::last_drawn`.
+    rendered_frames: u64,
+
     // Cached viewport
     viewport: D3D11_VIEWPORT,
 }
@@ -127,6 +136,55 @@ struct CachedSurfaceView {
     #[expect(dead_code)]
     texture: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
+}
+
+/// Hydra patch: an NV12 texture another device shares (`SurfaceSource::WindowsVideo`), with a
+/// view of each plane.
+struct CachedVideoTexture {
+    #[expect(dead_code)]
+    texture: ID3D11Texture2D,
+    mutex: IDXGIKeyedMutex,
+    luma: Option<ID3D11ShaderResourceView>,
+    chroma: Option<ID3D11ShaderResourceView>,
+    last_drawn: u64,
+}
+
+/// Frames a shared video texture stays open after it was last drawn.
+const VIDEO_TEXTURE_IDLE_FRAMES: u64 = 32;
+/// How long a draw waits for the decoder to release a video texture.
+const VIDEO_TEXTURE_WAIT_MS: u32 = 50;
+
+fn open_video_texture(device: &ID3D11Device, handle: isize) -> Result<CachedVideoTexture> {
+    let device1: ID3D11Device1 = device.cast()?;
+    let texture: ID3D11Texture2D = unsafe {
+        device1.OpenSharedResource1(windows::Win32::Foundation::HANDLE(handle as *mut _))?
+    };
+    let mutex: IDXGIKeyedMutex = texture.cast()?;
+    let plane = |format: DXGI_FORMAT| -> Result<Option<ID3D11ShaderResourceView>> {
+        let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                },
+            },
+        };
+        let mut view = None;
+        unsafe { device.CreateShaderResourceView(&texture, Some(&desc), Some(&mut view))? };
+        Ok(view)
+    };
+    // NV12: an R8 view reads the Y plane, an R8G8 view the interleaved CbCr plane.
+    let luma = plane(DXGI_FORMAT_R8_UNORM)?;
+    let chroma = plane(DXGI_FORMAT_R8G8_UNORM)?;
+    Ok(CachedVideoTexture {
+        texture,
+        mutex,
+        luma,
+        chroma,
+        last_drawn: 0,
+    })
 }
 
 struct PathResources {
@@ -1125,48 +1183,118 @@ impl DirectXRenderer {
         let surface_cb = [Some(self.pipelines.surfaces.params_buffer.clone())];
         let sampler = [self.globals.sampler.clone()];
 
+        let rendered_frame = resources.rendered_frames;
         for surface in surfaces {
-            let gpui::SurfaceSource::WindowsCapture(frame) = &surface.source else {
-                log::error!("DirectX renderer cannot import this surface source");
-                anyhow::bail!("unsupported surface source");
+            let (texture_srvs, color_format, mutex) = match &surface.source {
+                gpui::SurfaceSource::WindowsCapture(frame) => {
+                    let key = frame.texture().as_raw() as usize;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        resources.surface_views.entry(key)
+                    {
+                        let mut srv = None;
+                        // Screen capture uses windows 0.61 while this renderer uses 0.62. COM
+                        // interface pointers are ABI-stable; transferring an owned clone keeps
+                        // the texture alive.
+                        let texture = unsafe {
+                            ID3D11Texture2D::from_raw(frame.texture().clone().into_raw())
+                        };
+                        unsafe {
+                            devices.device.CreateShaderResourceView(
+                                &texture,
+                                None,
+                                Some(&mut srv),
+                            )?
+                        };
+                        entry.insert(CachedSurfaceView { texture, srv });
+                    }
+                    let texture_srv = &resources
+                        .surface_views
+                        .get(&key)
+                        .context("capture surface view cache insertion failed")?
+                        .srv;
+                    // The surface shader declares both planes; RGBA captures bind one view to
+                    // both.
+                    (
+                        [texture_srv.clone(), texture_srv.clone()],
+                        SurfaceColorFormat::Rgba,
+                        None,
+                    )
+                }
+                gpui::SurfaceSource::WindowsVideo(_) | gpui::SurfaceSource::WindowsVideoSlot(_) => {
+                    let current;
+                    let frame = match &surface.source {
+                        gpui::SurfaceSource::WindowsVideoSlot(slot) => {
+                            current = slot.current();
+                            match &current {
+                                Some(frame) => frame,
+                                None => continue,
+                            }
+                        }
+                        gpui::SurfaceSource::WindowsVideo(frame) => frame,
+                        _ => unreachable!(),
+                    };
+                    let video = match resources.video_textures.entry(frame.id()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            match open_video_texture(&devices.device, frame.handle()) {
+                                Ok(video) => entry.insert(video),
+                                Err(error) => {
+                                    log::error!("can't open a shared video texture: {error:#}");
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    video.last_drawn = rendered_frame;
+                    let color_format = match frame.color_space() {
+                        gpui::VideoColorSpace::Bt709Limited => SurfaceColorFormat::Yuv709Limited,
+                        gpui::VideoColorSpace::Bt601Limited => SurfaceColorFormat::Yuv601Limited,
+                        gpui::VideoColorSpace::Bt601Full => SurfaceColorFormat::Yuv,
+                    };
+                    (
+                        [video.luma.clone(), video.chroma.clone()],
+                        color_format,
+                        Some(video.mutex.clone()),
+                    )
+                }
+                _ => {
+                    log::error!("DirectX renderer cannot import this surface source");
+                    anyhow::bail!("unsupported surface source");
+                }
             };
-            let key = frame.texture().as_raw() as usize;
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                resources.surface_views.entry(key)
-            {
-                let mut srv = None;
-                // Screen capture uses windows 0.61 while this renderer uses 0.62. COM interface
-                // pointers are ABI-stable; transferring an owned clone keeps the texture alive.
-                let texture =
-                    unsafe { ID3D11Texture2D::from_raw(frame.texture().clone().into_raw()) };
-                unsafe {
-                    devices
-                        .device
-                        .CreateShaderResourceView(&texture, None, Some(&mut srv))?
+            // The decoder writes the texture under key 0; drawing holds the same key, and the
+            // keyed mutex orders the two devices' GPU work. A frame still being written is
+            // skipped rather than stalling the UI thread.
+            if let Some(mutex) = &mutex {
+                let acquired = unsafe {
+                    (Interface::vtable(mutex).AcquireSync)(
+                        Interface::as_raw(mutex),
+                        0,
+                        VIDEO_TEXTURE_WAIT_MS,
+                    )
                 };
-                entry.insert(CachedSurfaceView { texture, srv });
+                if acquired != windows::Win32::Foundation::S_OK {
+                    log::warn!("video texture busy, frame not drawn: {acquired:?}");
+                    continue;
+                }
             }
-            let texture_srv = &resources
-                .surface_views
-                .get(&key)
-                .context("capture surface view cache insertion failed")?
-                .srv;
-            // The surface shader declares both planes; RGBA captures bind one view to both.
-            let texture_srvs = [texture_srv.clone(), texture_srv.clone()];
 
             let uniforms = SurfaceUniforms {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.into(),
-                color_format: SurfaceColorFormat::Rgba,
-                opacity: 1.0,
+                color_format,
+                opacity: surface.opacity,
                 padding0: 0,
                 padding1: 0,
-                padding2: 0,
-                padding3: 0,
-                padding4: 0,
-                padding5: 0,
+                corner_radii: surface.corner_radii.into(),
             };
-            update_buffer(ctx, &self.pipelines.surfaces.params_buffer, &[uniforms])?;
+            let updated = update_buffer(ctx, &self.pipelines.surfaces.params_buffer, &[uniforms]);
+            if updated.is_err() {
+                if let Some(mutex) = &mutex {
+                    unsafe { mutex.ReleaseSync(0).log_err() };
+                }
+                updated?;
+            }
 
             unsafe {
                 ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -1181,6 +1309,9 @@ impl DirectXRenderer {
                 ctx.PSSetSamplers(SURFACE_SAMPLER_REGISTER, Some(&sampler));
                 ctx.OMSetBlendState(&self.pipelines.surfaces.blend, None, 0xFFFFFFFF);
                 ctx.DrawInstanced(4, 1, 0, 0);
+            }
+            if let Some(mutex) = &mutex {
+                unsafe { mutex.ReleaseSync(0).log_err() };
             }
         }
         Ok(())
@@ -1286,14 +1417,49 @@ impl DirectXRenderer {
         let resources = self.resources.as_ref().context("resources missing")?;
 
         let full_size = [full_width as f32, full_height as f32];
-        let (composite_source, source_size) =
-            if let Some(kernel) = BlurKernel::for_radius(blur_radius) {
-                let [ping, pong] = resources
-                    .blur
-                    .as_ref()
-                    .and_then(|blur| blur.scratch.as_ref())
-                    .context("blur resources were not prepared")?;
-                // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
+        let (composite_source, source_size) = if let Some(kernel) =
+            BlurKernel::for_radius(blur_radius)
+        {
+            let [ping, pong] = resources
+                .blur
+                .as_ref()
+                .and_then(|blur| blur.scratch.as_ref())
+                .context("blur resources were not prepared")?;
+            // Hydra patch: the passes write only the half-res region the composite reads
+            // (its bounds, dilated by the kernel's reach twice: the vertical pass reads
+            // the horizontal one's output that far out, which reads the downsample that
+            // far again), not the whole window, once per blur.
+            let reach = GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius + 4.0;
+            let read = if clip_rounded {
+                bounds
+            } else {
+                bounds.dilate(ScaledPixels(
+                    GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius,
+                ))
+            }
+            .intersect(&content_mask.dilate(ScaledPixels(reach)))
+            .dilate(ScaledPixels(2.0 * reach + 4.0));
+            let half = |value: f32, limit: f32| (value / 2.0).clamp(0.0, limit);
+            let scissor = windows::Win32::Foundation::RECT {
+                left: half(read.origin.x.0, blur_size[0]).floor() as i32,
+                top: half(read.origin.y.0, blur_size[1]).floor() as i32,
+                right: half((read.origin.x + read.size.width).0, blur_size[0]).ceil() as i32,
+                bottom: half((read.origin.y + read.size.height).0, blur_size[1]).ceil() as i32,
+            };
+            if scissor.right <= scissor.left || scissor.bottom <= scissor.top {
+                return Ok(());
+            }
+            let ctx = &self
+                .devices
+                .as_ref()
+                .context("devices missing")?
+                .device_context;
+            unsafe {
+                ctx.RSSetState(&resources.scissor_rasterizer);
+                ctx.RSSetScissorRects(Some(&[scissor]));
+            }
+            // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
+            let passes = (|| -> Result<()> {
                 self.dx_blur_pass(
                     &self.pipelines.blur_downsample_vertex,
                     &self.pipelines.blur_downsample_fragment,
@@ -1304,7 +1470,8 @@ impl DirectXRenderer {
                     &half_vp,
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                     3,
-                    true,
+                    // The scissored passes overwrite every texel the next one reads.
+                    false,
                 )?;
 
                 for (axis, source, target) in [
@@ -1321,14 +1488,18 @@ impl DirectXRenderer {
                         &half_vp,
                         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                         3,
-                        true,
+                        false,
                     )?;
                 }
+                Ok(())
+            })();
+            unsafe { ctx.RSSetState(&resources.rasterizer) };
+            passes?;
 
-                (&ping.source, blur_size)
-            } else {
-                (source_srv, full_size)
-            };
+            (&ping.source, blur_size)
+        } else {
+            (source_srv, full_size)
+        };
 
         // Content blur bleeds ~3·radius past the box; composite over a dilated rect.
         let composite_bounds = if clip_rounded {
@@ -1544,14 +1715,19 @@ impl DirectXResources {
 
         let (render_target, render_target_view, viewport) =
             create_resources(devices, &swap_chain, width, height)?;
-        set_rasterizer_state(&devices.device, &devices.device_context)?;
+        let (rasterizer, scissor_rasterizer) =
+            set_rasterizer_state(&devices.device, &devices.device_context)?;
         Ok(Self {
             swap_chain,
+            rasterizer,
+            scissor_rasterizer,
             render_target: Some(render_target),
             render_target_view,
             path: None,
             blur: None,
             surface_views: FxHashMap::default(),
+            video_textures: FxHashMap::default(),
+            rendered_frames: 0,
             viewport,
         })
     }
@@ -1644,6 +1820,11 @@ impl DirectXResources {
             .collect::<SmallVec<[usize; 4]>>();
         self.surface_views
             .retain(|key, _| active_keys.contains(key));
+        // Hydra patch: shared video textures close once unused for a while.
+        self.rendered_frames += 1;
+        let now = self.rendered_frames;
+        self.video_textures
+            .retain(|_, video| now - video.last_drawn <= VIDEO_TEXTURE_IDLE_FRAMES);
     }
 }
 
@@ -2301,8 +2482,13 @@ fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -
 }
 
 #[inline]
-fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Result<()> {
-    let desc = D3D11_RASTERIZER_DESC {
+/// Sets the default rasterizer state and returns it with a scissored copy (Hydra patch: blur
+/// passes run only over the region their composite reads).
+fn set_rasterizer_state(
+    device: &ID3D11Device,
+    device_context: &ID3D11DeviceContext,
+) -> Result<(ID3D11RasterizerState, ID3D11RasterizerState)> {
+    let mut desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
         CullMode: D3D11_CULL_NONE,
         FrontCounterClockwise: false.into(),
@@ -2319,8 +2505,14 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         device.CreateRasterizerState(&desc, Some(&mut state))?;
         state.unwrap()
     };
+    desc.ScissorEnable = true.into();
+    let scissor_state = unsafe {
+        let mut state = None;
+        device.CreateRasterizerState(&desc, Some(&mut state))?;
+        state.unwrap()
+    };
     unsafe { device_context.RSSetState(&rasterizer_state) };
-    Ok(())
+    Ok((rasterizer_state, scissor_state))
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc

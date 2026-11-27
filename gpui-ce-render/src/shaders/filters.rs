@@ -12,10 +12,9 @@ pub mod surface {
         pub opacity: f32,
         pub padding0: u32,
         pub padding1: u32,
-        pub padding2: u32,
-        pub padding3: u32,
-        pub padding4: u32,
-        pub padding5: u32,
+        // Hydra patch: rounds the corners of `bounds` (16-byte aligned, as WGSL
+        // and HLSL constant buffers place a struct).
+        pub corner_radii: Corners,
     }
     uniform!(group(1), binding(0), SURFACE_LOCALS: SurfaceUniforms);
     texture!(group(1), binding(1), SURFACE_TEXTURE: Texture2D<f32>);
@@ -29,7 +28,7 @@ pub mod surface {
         vec4f(-0.7010, 0.5291, -0.8860, 1.0),
     );
 
-    pub fn sample_yuv_surface(texture_position: Vec2f) -> Vec4f {
+    pub fn sample_yuv_surface(texture_position: Vec2f, color_format: SurfaceColorFormat) -> Vec4f {
         let luma = texture_sample_level(SURFACE_TEXTURE, SURFACE_SAMPLER, texture_position, 0.0).x;
         let chroma = texture_sample_level(
             SURFACE_CHROMA_TEXTURE,
@@ -38,7 +37,27 @@ pub mod surface {
             0.0,
         )
         .xy();
-        YCBCR_TO_LINEAR_RGB * vec4f(luma, chroma.x, chroma.y, 1.0)
+        if color_format == SurfaceColorFormat::Yuv {
+            return YCBCR_TO_LINEAR_RGB * vec4f(luma, chroma.x, chroma.y, 1.0);
+        }
+        // Hydra patch: limited range (Y 16-235, CbCr 16-240), then the matrix.
+        let y = (luma - 0.0627451) * 1.1643836;
+        let cb = (chroma.x - 0.5019608) * 1.1383929;
+        let cr = (chroma.y - 0.5019608) * 1.1383929;
+        if color_format == SurfaceColorFormat::Yuv709Limited {
+            return vec4f(
+                saturate(y + 1.5748 * cr),
+                saturate(y - 0.1873243 * cb - 0.4681243 * cr),
+                saturate(y + 1.8556 * cb),
+                1.0,
+            );
+        }
+        vec4f(
+            saturate(y + 1.402 * cr),
+            saturate(y - 0.3441363 * cb - 0.7141363 * cr),
+            saturate(y + 1.772 * cb),
+            1.0,
+        )
     }
 
     #[derive(Wgsl)]
@@ -70,9 +89,20 @@ pub mod surface {
             return transparent();
         }
         let locals = get!(SURFACE_LOCALS);
-        let fade = ContentMask::alpha(locals.content_mask, input.position.xy());
-        if locals.color_format == SurfaceColorFormat::Yuv {
-            return sample_yuv_surface(input.texture_position) * locals.opacity * fade;
+        let mut fade = ContentMask::alpha(locals.content_mask, input.position.xy());
+        // Hydra patch: rounded corners, antialiased like a quad's.
+        if !Corners::is_zero(locals.corner_radii) {
+            let distance = rounded_rectangle_signed_distance(
+                input.position.xy(),
+                locals.bounds,
+                locals.corner_radii,
+            );
+            fade *= antialiased_coverage(distance);
+        }
+        if locals.color_format != SurfaceColorFormat::Rgba {
+            return sample_yuv_surface(input.texture_position, locals.color_format)
+                * locals.opacity
+                * fade;
         }
         texture_sample_level(
             SURFACE_TEXTURE,
